@@ -6,7 +6,7 @@ await Bun.build({
   minify: true,
   splitting: true,
   sourcemap: "linked",
-  external: ["*"],
+  external: ["hono", "hono/*", "@hono/*", "node:net"],
 });
 
 console.log("Build complete!");

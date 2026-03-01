@@ -1,6 +1,6 @@
 {
   "name": "hono-ip",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A tiny, fast middleware for Hono that figures out your client's real IP address - even when your app sits behind proxies, load balancers, or CDNs.",
   "keywords": [
     "hono",
