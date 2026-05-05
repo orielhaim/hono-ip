@@ -1,119 +1,197 @@
 # hono-ip
 
-A tiny, fast middleware for [Hono](https://hono.dev) that figures out your client's real IP address - even when your app sits behind proxies, load balancers, or CDNs.
+Resolve the real client IP in [Hono](https://hono.dev) without getting spoofed.
 
-Works on **Node.js** and **Bun** out of the box. No regex. No dependencies.
+Works on Node, Bun, Deno, and Cloudflare Workers. Three dependencies, no regex parsing of security-sensitive headers, branded types end-to-end.
 
-## Why?
+## Why this exists
 
-Getting the "real" client IP in a web app is surprisingly annoying. Your server sees the proxy's address, not the user's. Different infrastructure stacks stuff the original IP into different headers - Cloudflare uses `CF-Connecting-IP`, AWS might use `X-Forwarded-For`, Fastly has its own thing, and so on.
+Most "get the client IP" libraries try a list of headers in a fixed order and return the first one that looks like an address. That's the bug. `X-Real-IP`, `X-Client-IP`, `True-Client-IP` - any client can send any of those, and most servers will believe them. The result is silent IP spoofing affecting rate limits, audit logs, fraud signals, and geofencing.
 
-This middleware checks all the common headers in a sensible order, validates every candidate with native `net.isIP` and hands you back a single, trustworthy string.
+`hono-ip` inverts the model. The operator declares the topology - "I'm behind Cloudflare," "I'm behind nginx with one trusted hop," "I'm direct" - and the middleware reads only what's been declared trustworthy. There is no fallback chain that can be tricked. There is no "try every header" mode.
 
-## Quick start
+## Install
 
 ```bash
 npm install hono-ip
 ```
 
+## A minimal example
+
 ```ts
 import { Hono } from "hono";
-import { ipMiddleware } from "hono-ip";
+import { ipMiddleware, cloudflare } from "hono-ip";
 
 const app = new Hono();
+app.use(ipMiddleware({ strategy: cloudflare() }));
 
-app.use(ipMiddleware());
-
-app.get("/", (c) => {
-  const ip = c.get("ip"); // string | null
-  return c.text(`Hello, ${ip ?? "stranger"}`);
-});
+app.get("/", (c) => c.text(`Hello ${c.var.ip ?? "stranger"}`));
 ```
 
-That's it. Every route after the middleware can read `c.get("ip")` or `c.var.ip`.
+`c.var.ip` is typed as `IpAddress | null`, where `IpAddress` is a branded string. You cannot pass a raw, unvalidated string where an `IpAddress` is expected - the validator is the only constructor.
 
-## Going deeper
+## Strategies
 
-### Trusted proxies
+A strategy tells the middleware exactly where to look and how to interpret what it finds. Pick one that matches your deployment.
 
-By default, the middleware returns the **leftmost** IP from `X-Forwarded-For` - the classic approach. The problem is that a malicious client can prepend whatever they want to that header:
+### Behind a known CDN
 
-```
-X-Forwarded-For: 6.6.6.6, <actual client>, <your proxy>
-                 ↑ attacker injected this
-```
-
-If you know your proxy IPs, pass them in. The middleware will then walk `X-Forwarded-For` **from the right**, skipping trusted addresses, and return the first IP it doesn't recognise - which is the real client:
+Presets exist for the common ones. Each reads a single platform-specific header and trusts it directly, because the platform strips client-supplied copies before your code runs.
 
 ```ts
-app.use(
-  ipMiddleware({
-    trustedProxies: new Set(["10.0.0.1", "10.0.0.2"]),
-  })
-);
+import { ipMiddleware, cloudflare, fly, vercel } from "hono-ip";
+
+app.use(ipMiddleware({ strategy: cloudflare() })); // CF-Connecting-IP
+app.use(ipMiddleware({ strategy: fly() }));        // Fly-Client-IP
+app.use(ipMiddleware({ strategy: vercel() }));     // X-Real-IP behind Vercel
 ```
 
-### Runtime-level connection info
-
-Headers can be spoofed. The one thing that _can't_ be faked is the TCP connection's remote address, which Hono exposes through its `getConnInfo` helper. Pass it in to use it as a final fallback:
+For any other platform that sets a single trusted header, use `single-header` directly:
 
 ```ts
-// Bun
+app.use(ipMiddleware({
+  strategy: { kind: "single-header", header: "x-azure-clientip" },
+}));
+```
+
+### Behind a reverse proxy you control
+
+Walks `X-Forwarded-For` right-to-left, skipping any address that matches your trusted CIDR ranges, and returns the first untrusted hop. That hop is, by definition, the closest address your proxy chain didn't add.
+
+```ts
+import { ipMiddleware, behindReverseProxy } from "hono-ip";
+
+app.use(ipMiddleware({
+  strategy: behindReverseProxy({
+    trustedProxies: ["loopback", "uniquelocal", "10.42.0.0/16"],
+  }),
+}));
+```
+
+`trustedProxies` accepts CIDR strings, named presets (`loopback`, `linklocal`, `uniquelocal`, `private`, `cloudflare`), or a custom predicate `(ip) => boolean` for fully dynamic trust (e.g. Kubernetes pod CIDRs resolved at startup). Validation happens at compile time - invalid CIDRs throw before the middleware ever runs.
+
+### RFC 7239 Forwarded header
+
+If your infrastructure emits the standardized `Forwarded` header instead of (or alongside) XFF:
+
+```ts
+app.use(ipMiddleware({
+  strategy: {
+    kind: "forwarded-rightmost-untrusted",
+    trustedProxies: ["loopback", "uniquelocal"],
+  },
+}));
+```
+
+Parsing uses `forwarded-parse`, the only widely-vetted spec-compliant parser. Malformed headers - including [sabotage attempts](https://adam-p.ca/blog/2022/03/forwarded-header-sabotage/) using unclosed quotes - cause the entire header to be discarded rather than partially interpreted.
+
+### Direct connections
+
+When there's no proxy, fall back to the runtime's connection info. You import the helper for your runtime to keep the package free of cross-runtime imports.
+
+```ts
+import { ipMiddleware, direct } from "hono-ip";
+import { getConnInfo } from "@hono/node-server/conninfo"; // or hono/bun, hono/deno
+
+app.use(ipMiddleware({ strategy: direct(getConnInfo) }));
+```
+
+### Hybrid deployments
+
+Compose strategies with `first-of`. Each child carries its own trust configuration, so the composition stays safe.
+
+```ts
+import { ipMiddleware } from "hono-ip";
 import { getConnInfo } from "hono/bun";
 
-// Node.js
-// import { getConnInfo } from "@hono/node-server/conninfo";
-
-app.use(ipMiddleware({ getConnInfo }));
+app.use(ipMiddleware({
+  strategy: {
+    kind: "first-of",
+    strategies: [
+      { kind: "single-header", header: "cf-connecting-ip" },
+      { kind: "conn-info", getConnInfo },
+    ],
+  },
+}));
 ```
 
-When no header yields a valid IP, the middleware will call `getConnInfo(c).remote.address` and use that instead. If `getConnInfo` throws (e.g. during tests where there's no real server), it's caught silently.
+## Audit and observability
 
-### Using `getClientIp` directly
-
-You don't have to use the middleware. The core function is exported on its own:
+Every resolution is recorded as a tagged outcome. The middleware writes both the IP and the full outcome to the context, so you can log exactly which strategy succeeded, which hop index was chosen, or which failure mode occurred.
 
 ```ts
-import { getClientIp } from "hono-ip";
+app.use(ipMiddleware({
+  strategy: behindReverseProxy({ trustedProxies: ["loopback"] }),
+  onFailure: (outcome) => {
+    // outcome.reason: "no-header" | "header-empty" | "all-hops-trusted"
+    //               | "header-too-large" | "too-many-entries" | ...
+    logger.warn({ outcome }, "ip resolution failed");
+  },
+}));
 
-app.get("/ip", (c) => {
-  const ip = getClientIp(c, {
-    trustedProxies: new Set(["10.0.0.1"]),
-  });
-  return c.json({ ip });
+app.get("/debug", (c) => {
+  const outcome = c.var.ipOutcome;
+  if (outcome.ok) {
+    return c.json({ ip: outcome.ip, source: outcome.source, hop: outcome.hopIndex });
+  }
+  return c.json({ failed: outcome.reason }, 400);
 });
 ```
 
-### Custom context variable name
-
-If `"ip"` collides with something in your app:
+For endpoints that genuinely cannot serve a request without a client IP - rate limiters, fraud scoring, geofencing - set `required: true` to short-circuit with `400` when resolution fails.
 
 ```ts
-app.use(ipMiddleware({ attributeName: "clientIp" }));
-
-// later
-c.get("clientIp");
+app.use("/api/*", ipMiddleware({
+  strategy: cloudflare(),
+  required: true,
+}));
 ```
 
-## Resolution order
+## Custom variable names
 
-The middleware checks these sources top-to-bottom and returns the first valid IP it finds:
+The variable name flows through the type system. Whatever name you pass becomes a typed property on `c.var`.
 
-| Priority | Source | Notes |
-|----------|--------|-------|
-| 1 | `X-Client-IP` | Set by some proxies and load balancers |
-| 2 | `X-Forwarded-For` | Leftmost valid IP, or rightmost untrusted if `trustedProxies` is set |
-| 3 | `CF-Connecting-IP` | Cloudflare |
-| 4 | `Fastly-Client-Ip` | Fastly |
-| 5 | `True-Client-Ip` | Akamai, Cloudflare enterprise |
-| 6 | `X-Real-IP` | Nginx default config |
-| 7 | `X-Cluster-Client-IP` | Rackspace, Riverbed |
-| 8 | `X-Forwarded` | Non-standard single-IP variant |
-| 9 | `Forwarded-For` | Non-standard single-IP variant |
-| 10 | `Forwarded` | RFC 7239 - parses `for="..."` value, handles bracketed IPv6 |
-| 11 | `X-Appengine-User-Ip` | Google App Engine |
-| 12 | `getConnInfo()` | Hono runtime adapter (Bun / Node / CF Workers / Deno / …) |
-| 13 | `Cf-Pseudo-IPv4` | Cloudflare pseudo IPv4 for IPv6 visitors |
+```ts
+app.use(ipMiddleware({ strategy: cloudflare(), variable: "clientIp" }));
+
+app.get("/", (c) => {
+  c.var.clientIp; // IpAddress | null, fully typed
+});
+```
+
+## Direct API
+
+The middleware is a thin wrapper around composable primitives. Use them directly when you need finer control:
+
+```ts
+import {
+  parseIp,           // (raw: string) => IpAddress | null
+  extractIp,         // unwraps "[::1]:443", "1.2.3.4:80", brackets, zone IDs
+  isIpV4, isIpV6,    // type predicates narrowing IpAddress -> IpV4 / IpV6
+  parseXForwardedFor,
+  parseForwarded,    // RFC 7239, returns left-to-right chain
+  compileTrust,      // build a reusable CIDR matcher from preset names + CIDRs
+  compileStrategy,   // pre-build a resolver, run it against any Hono context
+} from "hono-ip";
+```
+
+All parsers return discriminated unions. All validators return branded types or `null`. There are no thrown exceptions on the request path.
+
+## What's enforced for you
+
+IPv6 addresses are normalized; zone identifiers (`fe80::1%eth0`) are stripped before validation. IPv4-mapped IPv6 (`::ffff:1.2.3.4`) is collapsed to the v4 form so rate-limit keys are consistent. Only four-part-decimal IPv4 is accepted - odd forms like `0xc0.168.1.1` are rejected to prevent parser-mismatch vulnerabilities. Headers larger than 8 KiB or containing more than 50 entries are refused outright, neutralizing header-flood attacks. Trusted-proxy CIDR ranges are compiled once at middleware construction; the per-request hot path is a header read, a bounded split, and a linear scan with bitmask comparisons.
+
+## Strategy reference
+
+| Strategy | When to use | Reads | Trust model |
+|---|---|---|---|
+| `single-header` | Behind a CDN that sets and strips its own header | One specific header | Implicit - the platform is the perimeter |
+| `xff-rightmost-untrusted` | Behind your own reverse proxy chain | `X-Forwarded-For` | CIDR ranges you declare |
+| `forwarded-rightmost-untrusted` | Modern proxy emitting RFC 7239 | `Forwarded` | CIDR ranges you declare |
+| `xff-leftmost-insecure` | Migration only - flagged in audit logs | `X-Forwarded-For` | None (spoofable) |
+| `conn-info` | Direct connections, no proxy | TCP socket | Inherent (cannot be spoofed) |
+| `first-of` | Hybrid environments | Children in order | Each child carries its own |
 
 ## License
-Apache-2.0
+
+[Apache-2.0](LICENSE)
