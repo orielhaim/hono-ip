@@ -6,18 +6,12 @@ await rm("./dist", { recursive: true, force: true });
 const result = await Bun.build({
   entrypoints: ["./src/index.ts"],
   outdir: "./dist",
+  target: "node",
   format: "esm",
   minify: false,
   splitting: false,
   sourcemap: "external",
-  external: [
-    "hono",
-    "hono/*",
-    "@hono/*",
-    "ipaddr.js",
-    "forwarded-parse",
-    "node:net",
-  ],
+  packages: "external",
 });
 
 if (!result.success) {
