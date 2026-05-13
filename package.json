@@ -1,19 +1,12 @@
 {
   "name": "hono-ip",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Tiny and fast middleware for Hono that figures out your client's real IP address",
   "keywords": [
     "hono",
     "ip",
     "middleware",
-    "client-ip",
-    "x-forwarded-for",
-    "forwarded",
-    "rfc7239",
-    "cloudflare",
-    "proxy",
-    "cidr",
-    "trusted-proxies"
+    "client-ip"
   ],
   "type": "module",
   "main": "./dist/index.js",
@@ -26,7 +19,6 @@
     },
     "./package.json": "./package.json"
   },
-  "sideEffects": false,
   "files": [
     "dist",
     "README.md",
